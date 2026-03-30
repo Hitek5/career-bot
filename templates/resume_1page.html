@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+    @page {
+        size: A4;
+        margin: 14mm 16mm;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: "Liberation Sans", "Helvetica Neue", Arial, sans-serif;
+        font-size: 9pt;
+        line-height: 1.35;
+        color: #2d2d2d;
+    }
+
+    /* --- Header --- */
+    .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        border-bottom: 2.5px solid #1a1a2e;
+        padding-bottom: 7px;
+        margin-bottom: 8px;
+    }
+    .name {
+        font-size: 22pt;
+        font-weight: 700;
+        color: #1a1a2e;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+    }
+    .target-position {
+        font-size: 10pt;
+        color: #555;
+        margin-top: 2px;
+    }
+    .contacts {
+        text-align: right;
+        font-size: 8pt;
+        color: #444;
+        line-height: 1.6;
+        white-space: nowrap;
+    }
+
+    /* --- Summary --- */
+    .summary {
+        margin-bottom: 10px;
+        font-size: 9pt;
+        color: #333;
+        line-height: 1.4;
+    }
+
+    /* --- Section titles --- */
+    .section-title {
+        font-size: 9pt;
+        font-weight: 700;
+        color: #1a1a2e;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        border-bottom: 1px solid #ccc;
+        padding-bottom: 2px;
+        margin-bottom: 6px;
+        margin-top: 9px;
+    }
+
+    /* --- Experience --- */
+    .job { margin-bottom: 7px; }
+    .job-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+    }
+    .job-company {
+        font-weight: 700;
+        font-size: 9.5pt;
+        color: #1a1a2e;
+    }
+    .job-period {
+        font-size: 8pt;
+        color: #777;
+        white-space: nowrap;
+    }
+    .job-position {
+        font-style: italic;
+        color: #555;
+        font-size: 8.5pt;
+        margin-bottom: 2px;
+    }
+    .achievements {
+        list-style: none;
+        padding-left: 0;
+    }
+    .achievements li {
+        padding-left: 10px;
+        position: relative;
+        font-size: 8.5pt;
+        margin-bottom: 1px;
+        line-height: 1.3;
+    }
+    .achievements li::before {
+        content: "—";
+        position: absolute;
+        left: 0;
+        color: #1a1a2e;
+    }
+
+    /* --- Bottom two-column --- */
+    .bottom {
+        display: flex;
+        gap: 24px;
+        margin-top: 6px;
+    }
+    .bottom-left { flex: 1; }
+    .bottom-right { flex: 1; }
+
+    /* --- Education --- */
+    .edu-item {
+        margin-bottom: 3px;
+        font-size: 8.5pt;
+    }
+    .edu-inst { font-weight: 700; }
+    .edu-year {
+        color: #777;
+        float: right;
+        font-size: 8pt;
+    }
+
+    /* --- Info lines --- */
+    .info-line {
+        font-size: 8.5pt;
+        margin-bottom: 2px;
+        line-height: 1.4;
+    }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <div>
+        <div class="name">{{FULL_NAME}}</div>
+        <div class="target-position">{{TARGET_POSITION}}</div>
+    </div>
+    <div class="contacts">{{CONTACTS}}</div>
+</div>
+
+<div class="summary">{{SUMMARY}}</div>
+
+<div class="section-title">Опыт работы</div>
+{{EXPERIENCE}}
+
+<div class="bottom">
+    <div class="bottom-left">
+        <div class="section-title">Образование</div>
+        {{EDUCATION}}
+    </div>
+    <div class="bottom-right">
+        <div class="section-title">Навыки</div>
+        <div class="info-line">{{SKILLS}}</div>
+        {{CERTIFICATIONS_SECTION}}
+        {{LANGUAGES_SECTION}}
+    </div>
+</div>
+
+</body>
+</html>

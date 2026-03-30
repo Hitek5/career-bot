@@ -1,0 +1,8 @@
+career_bot.db
+__pycache__/
+*.pyc
+.env
+output/
+logs/
+
+venv/
