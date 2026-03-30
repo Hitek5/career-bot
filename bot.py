@@ -35,6 +35,18 @@ STATE_NEW = "new"
 STATE_UPLOADING = "uploading"
 STATE_ANSWERING = "answering"
 STATE_READY = "ready"
+STATE_EDITING = "editing"
+
+# Editable profile fields
+EDIT_FIELDS = {
+    "edit_summary": {"label": "📝 О себе (summary)", "key": "summary", "hint": "Напиши краткое описание себя (2-3 предложения, продающее):"},
+    "edit_positions": {"label": "🎯 Целевые позиции", "key": "target_positions", "hint": "Перечисли целевые позиции через запятую:"},
+    "edit_salary": {"label": "💰 Зарплата", "key": "salary_range", "hint": "Укажи желаемый диапазон зарплаты (например: 200 000 — 350 000):"},
+    "edit_format": {"label": "🏢 Формат работы", "key": "work_format", "hint": "Выбери формат:", "options": ["офис", "удалённо", "гибрид"]},
+    "edit_contacts": {"label": "📱 Контакты", "key": "contacts", "hint": "Укажи контакты в формате:\nТелефон: ...\nEmail: ...\nTelegram: ...\nLinkedIn: ..."},
+    "edit_skills": {"label": "🛠 Навыки", "key": "skills", "hint": "Перечисли ключевые навыки через запятую (я пересоберу с уровнями через AI):"},
+    "edit_experience": {"label": "💼 Опыт работы", "key": "experience", "hint": "Опиши опыт работы. Можно одним сообщением или несколькими.\nФормат: Компания, должность, период, чем занимался, достижения."},
+}
 
 QUESTIONS_TEXT = (
     "Теперь расскажи о себе текстом. Можешь ответить одним или несколькими сообщениями:\n\n"
@@ -114,7 +126,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📄 Анализировать вакансию", callback_data="mode_vacancy")],
             [InlineKeyboardButton("👤 Мой профиль", callback_data="show_profile")],
-            [InlineKeyboardButton("🔄 Пересоздать профиль", callback_data="restart_onboarding")],
+            [InlineKeyboardButton("✏️ Редактировать профиль", callback_data="edit_menu")],
         ])
         await update.message.reply_text(
             f"С возвращением, {tg_user.first_name}! 👋\n\n"
@@ -203,15 +215,29 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _update_state(update.effective_user.id, STATE_UPLOADING)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Документы загружены", callback_data="docs_done")],
-    ])
-    await update.message.reply_text(
-        "📎 Загружай новые документы. Они дополнят существующий профиль.\n"
-        "Когда закончишь — нажми кнопку.",
-        reply_markup=kb,
-    )
+    profile = _get_profile(update.effective_user.id)
+    if not profile or not profile.profile_json:
+        await update.message.reply_text("Профиль ещё не создан. Используй /start")
+        return
+
+    await _show_edit_menu(update.message)
+
+
+async def _show_edit_menu(message, prefix_text=""):
+    """Show profile edit menu with field buttons."""
+    buttons = []
+    for field_id, field in EDIT_FIELDS.items():
+        buttons.append([InlineKeyboardButton(field["label"], callback_data=field_id)])
+    buttons.append([InlineKeyboardButton("📎 Добавить документы", callback_data="add_docs")])
+    buttons.append([InlineKeyboardButton("🔄 Пересоздать с нуля", callback_data="restart_onboarding")])
+    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")])
+
+    text = prefix_text or "✏️ **Редактирование профиля**\n\nВыбери что хочешь изменить:"
+    kb = InlineKeyboardMarkup(buttons)
+    try:
+        await message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        await message.reply_text(text, reply_markup=kb)
 
 
 # =============================================================================
@@ -345,6 +371,214 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _generate_and_send_resume(query.message, tg_user, analysis_id)
     elif data == "skip_resume":
         await query.message.reply_text("👌 Окей. Отправь ссылку на другую вакансию когда будет нужно.")
+    elif data == "add_docs":
+        _update_state(tg_user.id, STATE_UPLOADING)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Документы загружены", callback_data="docs_added")],
+        ])
+        await query.message.reply_text(
+            "📎 Загружай новые документы. Они дополнят существующий профиль.\n"
+            "Когда закончишь — нажми кнопку.",
+            reply_markup=kb,
+        )
+    elif data == "docs_added":
+        _update_state(tg_user.id, STATE_READY)
+        await _show_edit_menu(query.message, "✅ Документы добавлены!\n\nЧто ещё изменить?")
+    elif data == "back_to_main":
+        _update_state(tg_user.id, STATE_READY)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📄 Анализировать вакансию", callback_data="mode_vacancy")],
+            [InlineKeyboardButton("👤 Мой профиль", callback_data="show_profile")],
+            [InlineKeyboardButton("✏️ Редактировать профиль", callback_data="edit_menu")],
+        ])
+        await query.message.reply_text("Главное меню:", reply_markup=kb)
+    elif data == "edit_menu":
+        await _show_edit_menu(query.message)
+    elif data in EDIT_FIELDS:
+        field = EDIT_FIELDS[data]
+        context.user_data["editing_field"] = data
+
+        if "options" in field:
+            # Show options as buttons
+            buttons = [
+                [InlineKeyboardButton(opt, callback_data=f"setval_{data}_{opt}")]
+                for opt in field["options"]
+            ]
+            buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="edit_menu")])
+            await query.message.reply_text(
+                field["hint"], reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            _update_state(tg_user.id, STATE_EDITING)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Отмена", callback_data="cancel_edit")],
+            ])
+            # Show current value
+            profile = _get_profile(tg_user.id)
+            current = ""
+            if profile and profile.profile_json:
+                pdata = json.loads(profile.profile_json)
+                val = pdata.get(field["key"], "")
+                if isinstance(val, list):
+                    current = ", ".join(str(v) for v in val)
+                elif isinstance(val, dict):
+                    current = "\n".join(f"{k}: {v}" for k, v in val.items() if v)
+                else:
+                    current = str(val)
+            hint = field["hint"]
+            if current:
+                hint += f"\n\n📋 Текущее значение:\n{current}"
+            await query.message.reply_text(hint, reply_markup=kb)
+    elif data.startswith("setval_"):
+        parts = data.split("_", 2)
+        field_id = parts[1] + "_" + parts[1].split("edit_")[-1]  # reconstruct
+        # Actually parse properly
+        _, field_id_part1, value = data.split("_", 2)
+        field_id = f"edit_{field_id_part1}"
+        if field_id not in EDIT_FIELDS:
+            # Try finding the right field
+            for fid in EDIT_FIELDS:
+                if data.startswith(f"setval_{fid}_"):
+                    field_id = fid
+                    value = data[len(f"setval_{fid}_"):]
+                    break
+        await _apply_edit(query.message, tg_user, field_id, value)
+    elif data == "cancel_edit":
+        _update_state(tg_user.id, STATE_READY)
+        context.user_data.pop("editing_field", None)
+        await _show_edit_menu(query.message, "Отменено.")
+
+
+async def _apply_edit(message, tg_user, field_id: str, value: str):
+    """Apply a profile field edit."""
+    if field_id not in EDIT_FIELDS:
+        await message.reply_text("❌ Неизвестное поле.")
+        return
+
+    field = EDIT_FIELDS[field_id]
+    key = field["key"]
+
+    session = get_session()
+    user = session.query(User).filter_by(tg_id=tg_user.id).first()
+    profile = session.query(Profile).filter_by(user_id=user.id).first()
+
+    if not profile or not profile.profile_json:
+        session.close()
+        await message.reply_text("Профиль не найден.")
+        return
+
+    pdata = json.loads(profile.profile_json)
+
+    # Parse value based on field type
+    if key == "target_positions":
+        pdata[key] = [p.strip() for p in value.split(",") if p.strip()]
+    elif key == "contacts":
+        # Parse "Phone: ...\nEmail: ..." format
+        contacts = pdata.get("contacts", {})
+        for line in value.split("\n"):
+            line = line.strip()
+            if ":" in line:
+                k, v = line.split(":", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if "телеф" in k or "phone" in k:
+                    contacts["phone"] = v
+                elif "email" in k or "почт" in k:
+                    contacts["email"] = v
+                elif "telegram" in k or "tg" in k:
+                    contacts["telegram"] = v
+                elif "linkedin" in k:
+                    contacts["linkedin"] = v
+        pdata[key] = contacts
+    elif key == "skills":
+        # Rebuild skills with AI
+        from core.ai_engine import call_claude
+        import asyncio
+        try:
+            resp = await call_claude(
+                "Ты карьерный аналитик. Пользователь обновил список навыков. "
+                "Верни JSON: {\"hard\": [{\"name\": \"...\", \"level\": \"...\"}], \"soft\": [{\"name\": \"...\", \"level\": \"...\"}]}. "
+                "Определи уровень каждого навыка. Только JSON.",
+                f"Навыки: {value}",
+                max_tokens=2000,
+            )
+            import re as _re
+            m = _re.search(r'(\{[\s\S]*\})', resp)
+            if m:
+                pdata[key] = json.loads(m.group(1))
+        except Exception as e:
+            logger.error("Skills AI parse failed: %s", e)
+            pdata[key] = {"hard": [{"name": s.strip(), "level": "—"} for s in value.split(",")], "soft": []}
+    elif key == "experience":
+        # Rebuild experience with AI
+        from core.ai_engine import call_claude
+        try:
+            resp = await call_claude(
+                "Ты карьерный аналитик. Пользователь обновил опыт работы. "
+                "Верни JSON массив: [{\"company\": \"\", \"position\": \"\", \"period\": \"\", "
+                "\"description\": \"\", \"achievements\": [\"...\"]}]. Только JSON массив.",
+                f"Опыт: {value}",
+                max_tokens=3000,
+            )
+            import re as _re
+            m = _re.search(r'(\[[\s\S]*\])', resp)
+            if m:
+                pdata[key] = json.loads(m.group(1))
+        except Exception as e:
+            logger.error("Experience AI parse failed: %s", e)
+    else:
+        # Simple string fields: summary, salary_range, work_format
+        pdata[key] = value
+
+    # Regenerate user-facing summary
+    pdata["profile_summary_for_user"] = _build_summary_text(pdata)
+
+    profile.profile_json = json.dumps(pdata, ensure_ascii=False)
+    profile.summary = pdata.get("summary", "")
+    profile.skills = json.dumps(pdata.get("skills", {}), ensure_ascii=False)
+    profile.target_positions = json.dumps(pdata.get("target_positions", []), ensure_ascii=False)
+    profile.contacts = json.dumps(pdata.get("contacts", {}), ensure_ascii=False)
+    profile.salary_range = pdata.get("salary_range", "")
+    if key == "work_format":
+        profile.work_format = value
+
+    user.state = STATE_READY
+    session.commit()
+    session.close()
+
+    await _show_edit_menu(message, f"✅ {field['label']} обновлено!\n\nЧто ещё изменить?")
+
+
+def _build_summary_text(pdata: dict) -> str:
+    """Build a readable profile summary from profile data."""
+    parts = []
+    if pdata.get("full_name"):
+        parts.append(f"**{pdata['full_name']}**")
+    if pdata.get("summary"):
+        parts.append(pdata["summary"])
+    if pdata.get("target_positions"):
+        positions = pdata["target_positions"]
+        if isinstance(positions, list):
+            parts.append(f"🎯 Целевые позиции: {', '.join(positions)}")
+    if pdata.get("salary_range"):
+        parts.append(f"💰 Зарплата: {pdata['salary_range']}")
+    if pdata.get("work_format"):
+        parts.append(f"🏢 Формат: {pdata['work_format']}")
+    if pdata.get("skills"):
+        skills = pdata["skills"]
+        if isinstance(skills, dict):
+            hard = skills.get("hard", [])
+            if hard:
+                names = [s["name"] if isinstance(s, dict) else str(s) for s in hard[:10]]
+                parts.append(f"🛠 Навыки: {', '.join(names)}")
+    if pdata.get("experience"):
+        exp = pdata["experience"]
+        if isinstance(exp, list) and exp:
+            parts.append(f"💼 Опыт: {len(exp)} мест работы")
+            for e in exp[:3]:
+                if isinstance(e, dict):
+                    parts.append(f"  • {e.get('position', '')} @ {e.get('company', '')} ({e.get('period', '')})")
+    return "\n".join(parts)
 
 
 async def _on_docs_done(query, tg_user):
@@ -449,6 +683,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = _get_user(tg_user.id)
     if not user:
         await update.message.reply_text("Используй /start для начала.")
+        return
+
+    # If editing profile field — apply edit
+    if user.state == STATE_EDITING:
+        field_id = context.user_data.get("editing_field")
+        if field_id:
+            context.user_data.pop("editing_field", None)
+            await _apply_edit(update.message, tg_user, field_id, text)
+        else:
+            _update_state(tg_user.id, STATE_READY)
+            await update.message.reply_text("Не понял, что редактируем. Используй /update")
         return
 
     # If answering questions — save answers
