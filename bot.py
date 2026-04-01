@@ -5,29 +5,40 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
+import traceback
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+import httpx
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, LabeledPrice
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes,
+    PreCheckoutQueryHandler, filters, ContextTypes,
 )
 
-from config import BOT_TOKEN, is_user_allowed, OUTPUT_DIR
+from config import (
+    BOT_TOKEN, OUTPUT_DIR, ADMIN_TG_ID,
+    TRIAL_ANALYSES, TRIAL_RESUMES, get_user_role, is_unlimited,
+    PAYMASTER_TOKEN, PAYMASTER_API_TOKEN, PAYMASTER_MERCHANT_ID, PACKAGES,
+)
 from db.database import init_db, get_session
-from db.models import User, Profile, Document, VacancyAnalysis, GeneratedResume
+from db.models import User, Profile, Document, VacancyAnalysis, GeneratedResume, Payment
 from core.profile_builder import build_profile
 from core.vacancy_analyzer import process_vacancy_url, process_vacancy_text
 from core.resume_generator import generate_resume_data, generate_pdf, generate_docx
 from parsers.pdf_parser import parse_pdf
 from parsers.docx_parser import parse_docx
+from parsers.universal_parser import parse_document, ALL_SUPPORTED, LIBREOFFICE_FORMATS
 from parsers.vacancy_parser import extract_hh_vacancy_id
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+# Suppress httpx polling spam
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- States ---
@@ -61,20 +72,36 @@ QUESTIONS_TEXT = (
 )
 
 
-def _get_or_create_user(tg_user) -> User:
+def _get_or_create_user(tg_user) -> tuple[User, bool]:
+    """Return (user, is_new)."""
     session = get_session()
     user = session.query(User).filter_by(tg_id=tg_user.id).first()
+    is_new = False
     if not user:
+        role = get_user_role(tg_user.id)
         user = User(
             tg_id=tg_user.id,
             username=tg_user.username or "",
             full_name=tg_user.full_name or "",
             state=STATE_NEW,
+            role=role,
+            analyses_left=-1 if is_unlimited(role) else TRIAL_ANALYSES,
+            resumes_left=-1 if is_unlimited(role) else TRIAL_RESUMES,
         )
         session.add(user)
         session.commit()
+        is_new = True
+    session.expunge(user)
     session.close()
-    return user
+    return user, is_new
+
+
+async def _notify_admin(bot, text: str):
+    """Send notification to admin."""
+    try:
+        await bot.send_message(chat_id=ADMIN_TG_ID, text=text)
+    except Exception as e:
+        logger.warning("Admin notify failed: %s", e)
 
 
 def _update_state(tg_id: int, state: str):
@@ -89,6 +116,8 @@ def _update_state(tg_id: int, state: str):
 def _get_user(tg_id: int) -> User | None:
     session = get_session()
     user = session.query(User).filter_by(tg_id=tg_id).first()
+    if user:
+        session.expunge(user)
     session.close()
     return user
 
@@ -112,19 +141,22 @@ def _get_profile(tg_id: int) -> Profile | None:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
-    if not is_user_allowed(tg_user.id):
-        await update.message.reply_text(
-            "⛔ Бот доступен по приглашению. Обратитесь к администратору."
-        )
-        return
+    user, is_new = _get_or_create_user(tg_user)
 
-    user = _get_or_create_user(tg_user)
+    if is_new:
+        await _notify_admin(
+            context.bot,
+            f"🆕 Новый пользователь CareerBot:\n"
+            f"👤 {tg_user.full_name} (@{tg_user.username or '—'})\n"
+            f"🆔 {tg_user.id}\n"
+            f"📊 Роль: {user.role}",
+        )
 
     # Check if already has a profile
     profile = _get_profile(tg_user.id)
     if profile and profile.profile_json:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📄 Анализировать вакансию", callback_data="mode_vacancy")],
+            [InlineKeyboardButton("📄 Аналитика вакансии", callback_data="mode_vacancy")],
             [InlineKeyboardButton("👤 Мой профиль", callback_data="show_profile")],
             [InlineKeyboardButton("✏️ Редактировать профиль", callback_data="edit_menu")],
         ])
@@ -141,7 +173,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await update.message.reply_text(
         f"Привет, {tg_user.first_name}! 🚀\n\n"
-        "Я помогу с поиском работы: проанализирую вакансии, "
+        "Я помогу с поиском работы: сделаю аналитику вакансий, "
         "подготовлю адаптированное резюме.\n\n"
         "📎 **Для начала загрузи документы** (PDF, DOCX, TXT):\n"
         "— Резюме (любое, даже старое)\n"
@@ -184,10 +216,10 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.close()
 
     if not analyses:
-        await update.message.reply_text("Пока нет анализов вакансий. Отправь ссылку hh.ru!")
+        await update.message.reply_text("Пока нет аналитики вакансий. Отправь ссылку hh.ru!")
         return
 
-    lines = ["📋 **Последние анализы:**\n"]
+    lines = ["📋 **Последняя аналитика:**\n"]
     for i, a in enumerate(analyses, 1):
         match_emoji = "✅" if (a.match_percent or 0) >= 70 else "⚠️"
         lines.append(
@@ -203,12 +235,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 **CareerBot — команды:**\n\n"
         "/start — начать / главное меню\n"
         "/profile — показать профиль\n"
-        "/history — история анализов\n"
+        "/history — история аналитики\n"
         "/update — обновить профиль\n"
         "/help — эта справка\n\n"
         "**Как пользоваться:**\n"
         "1. Загрузи документы и ответь на вопросы → создаётся профиль\n"
-        "2. Отправь ссылку hh.ru или текст вакансии → анализ + рекомендации\n"
+        "2. Отправь ссылку hh.ru или текст вакансии → аналитика + рекомендации\n"
         "3. Нажми «Готовить резюме» → получишь PDF и DOCX",
         parse_mode="Markdown",
     )
@@ -246,8 +278,6 @@ async def _show_edit_menu(message, prefix_text=""):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
-    if not is_user_allowed(tg_user.id):
-        return
 
     user = _get_user(tg_user.id)
     if not user or user.state not in (STATE_UPLOADING, STATE_NEW):
@@ -267,11 +297,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fname = doc.file_name or "unknown"
     ext = Path(fname).suffix.lower()
 
-    if ext not in (".pdf", ".docx", ".txt", ".doc"):
-        await update.message.reply_text(f"⚠️ Формат {ext} не поддерживается. Жду PDF, DOCX или TXT.")
+    if ext not in ALL_SUPPORTED:
+        supported = ", ".join(sorted(ALL_SUPPORTED))
+        await update.message.reply_text(
+            f"⚠️ Формат {ext} не поддерживается.\n"
+            f"Поддерживаемые: {supported}"
+        )
         return
 
-    await update.message.reply_text(f"📥 Обрабатываю {fname}...")
+    if ext in LIBREOFFICE_FORMATS:
+        fmt_names = {".doc": "Word 97-2003", ".odt": "OpenDocument", ".rtf": "Rich Text"}
+        await update.message.reply_text(
+            f"📥 Обрабатываю {fname}...\n"
+            f"⚠️ Формат {fmt_names.get(ext, ext)} — конвертирую, это может занять несколько секунд."
+        )
+    else:
+        await update.message.reply_text(f"📥 Обрабатываю {fname}...")
 
     # Download file
     file = await doc.get_file()
@@ -280,13 +321,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
 
     try:
-        if ext == ".pdf":
-            content = parse_pdf(tmp_path)
-        elif ext in (".docx", ".doc"):
-            content = parse_docx(tmp_path)
-        else:  # .txt
-            with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
+        try:
+            content = parse_document(tmp_path)
+        except (RuntimeError, FileNotFoundError, subprocess.TimeoutExpired, ValueError) as conv_err:
+            logger.error("Document parsing failed for %s: %s", fname, conv_err)
+            await update.message.reply_text(
+                f"⚠️ Не удалось обработать {fname}.\n\n"
+                "**Что делать:**\n"
+                "1. Открой файл в Word / Google Docs\n"
+                "2. Сохрани как .docx или .pdf\n"
+                "3. Загрузи сюда\n",
+                parse_mode="Markdown",
+            )
+            return
 
         if not content.strip():
             await update.message.reply_text(f"⚠️ Не удалось извлечь текст из {fname}")
@@ -357,7 +404,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _update_state(tg_user.id, STATE_READY)
         await query.message.reply_text(
             "✅ Профиль сохранён!\n\n"
-            "Теперь отправляй ссылки на вакансии hh.ru — я проанализирую "
+            "Теперь отправляй ссылки на вакансии hh.ru — я сделаю аналитику "
             "и подготовлю адаптированное резюме."
         )
     elif data == "profile_redo":
@@ -387,7 +434,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "back_to_main":
         _update_state(tg_user.id, STATE_READY)
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📄 Анализировать вакансию", callback_data="mode_vacancy")],
+            [InlineKeyboardButton("📄 Аналитика вакансии", callback_data="mode_vacancy")],
             [InlineKeyboardButton("👤 Мой профиль", callback_data="show_profile")],
             [InlineKeyboardButton("✏️ Редактировать профиль", callback_data="edit_menu")],
         ])
@@ -447,6 +494,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _update_state(tg_user.id, STATE_READY)
         context.user_data.pop("editing_field", None)
         await _show_edit_menu(query.message, "Отменено.")
+    elif data == "buy_menu":
+        await _show_payment_options(query.message, "buy")
+    elif data.startswith("buy_stars_"):
+        pack_id = data.replace("buy_stars_", "")
+        await _send_stars_invoice(query.message, tg_user, pack_id)
+    elif data == "buy_card_menu":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 199 ₽ — Старт (5+5)", callback_data="buy_card_pack_5")],
+            [InlineKeyboardButton("💳 499 ₽ — Стандарт (20+15)", callback_data="buy_card_pack_20")],
+            [InlineKeyboardButton("💳 999 ₽ — Про (50+30)", callback_data="buy_card_pack_50")],
+            [InlineKeyboardButton("💳 1 999 ₽ — Макс (100+100)", callback_data="buy_card_pack_100")],
+        ])
+        await query.message.reply_text("Выбери пакет для оплаты картой:", reply_markup=kb)
+    elif data.startswith("buy_card_"):
+        pack_id = data.replace("buy_card_", "")
+        await _send_paymaster_invoice(query.message, tg_user, pack_id)
+    elif data == "buy_sber":
+        await query.message.reply_text(
+            "💰 **Перевод на Сбер:**\n\n"
+            "Номер: `+79035117700`\n"
+            "Получатель: Александр М.\n\n"
+            "**Суммы:**\n"
+            "• Старт (5+5) — 199 ₽\n"
+            "• Стандарт (20+15) — 499 ₽\n"
+            "• Про (50+30) — 999 ₽\n"
+            "• Макс (100+100) — 1 999 ₽\n\n"
+            "После перевода напиши @Amoskv с чеком — активирую в течение часа.",
+            parse_mode="Markdown",
+        )
 
 
 async def _apply_edit(message, tg_user, field_id: str, value: str):
@@ -673,8 +749,6 @@ async def _on_answers_done(query, tg_user, context):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
-    if not is_user_allowed(tg_user.id):
-        return
 
     text = update.message.text.strip()
     if not text:
@@ -728,10 +802,15 @@ async def _handle_vacancy_input(update, context, user, text):
         await update.message.reply_text("Профиль не найден. Используй /start")
         return
 
+    # Check analysis limit for trial users
+    if not is_unlimited(user.role) and user.analyses_left is not None and user.analyses_left <= 0:
+        await _show_payment_options(update.message, "analyses")
+        return
+
     # Check if it's an HH URL
     is_url = bool(extract_hh_vacancy_id(text))
 
-    await update.message.reply_text("🔍 Анализирую вакансию... ⏳")
+    await update.message.reply_text("🔍 Делаю аналитику вакансии... ⏳")
 
     try:
         if is_url:
@@ -754,12 +833,22 @@ async def _handle_vacancy_input(update, context, user, text):
             match_percent=analysis.get("match_percent", 0),
         )
         session.add(va)
+        # Decrement analysis counter for trial users
+        if not is_unlimited(db_user.role) and db_user.analyses_left is not None and db_user.analyses_left > 0:
+            db_user.analyses_left -= 1
         session.commit()
         va_id = va.id
+        analyses_left = db_user.analyses_left
+        user_role = db_user.role
         session.close()
 
         # Send analysis
-        analysis_text = analysis.get("analysis_text", "Анализ завершён.")
+        analysis_text = analysis.get("analysis_text", "Аналитика готова.")
+
+        # Show balance for trial users
+        if not is_unlimited(user_role) and analyses_left is not None:
+            analysis_text += f"\n\n📊 Осталось аналитик: {analyses_left}/{TRIAL_ANALYSES}"
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📄 Готовить резюме", callback_data=f"gen_resume_{va_id}")],
             [InlineKeyboardButton("⏭ Пропустить", callback_data="skip_resume")],
@@ -769,7 +858,7 @@ async def _handle_vacancy_input(update, context, user, text):
 
     except Exception as e:
         logger.error("Vacancy analysis failed: %s", e)
-        await update.message.reply_text(f"❌ Ошибка анализа: {e}")
+        await update.message.reply_text(f"❌ Ошибка аналитики: {e}")
 
 
 # =============================================================================
@@ -777,15 +866,22 @@ async def _handle_vacancy_input(update, context, user, text):
 # =============================================================================
 
 async def _generate_and_send_resume(message, tg_user, analysis_id: int):
-    await message.reply_text("⏳ Генерирую адаптированное резюме... 30-60 сек.")
-
+    # Check resume limit for trial users
     session = get_session()
     user = session.query(User).filter_by(tg_id=tg_user.id).first()
+
+    if not is_unlimited(user.role) and user.resumes_left is not None and user.resumes_left <= 0:
+        session.close()
+        await _show_payment_options(message, "resumes")
+        return
+
+    await message.reply_text("⏳ Генерирую адаптированное резюме... 30-60 сек.")
+
     profile = session.query(Profile).filter_by(user_id=user.id).first()
     va = session.query(VacancyAnalysis).filter_by(id=analysis_id).first()
 
     if not profile or not va:
-        await message.reply_text("❌ Профиль или анализ не найден.")
+        await message.reply_text("❌ Профиль или аналитика не найдены.")
         session.close()
         return
 
@@ -828,11 +924,24 @@ async def _generate_and_send_resume(message, tg_user, analysis_id: int):
             caption="📋 Резюме формат HH (DOCX) — для загрузки на hh.ru",
         )
 
+        # Decrement resume counter for trial users
+        if not is_unlimited(user.role) and user.resumes_left is not None and user.resumes_left > 0:
+            user.resumes_left -= 1
+            session.commit()
+
+        balance_text = ""
+        if not is_unlimited(user.role):
+            balance_text = (
+                f"\n\n📊 Баланс: аналитик — {user.analyses_left}, "
+                f"резюме — {user.resumes_left}"
+            )
+
         await message.reply_text(
             "✅ Готово! Два файла:\n"
             "• PDF — красивый, для email/ЛС\n"
             "• DOCX — для загрузки на hh.ru\n\n"
-            "Отправь ссылку на другую вакансию для нового анализа."
+            "Отправь ссылку на другую вакансию для новой аналитики."
+            + balance_text
         )
 
     except Exception as e:
@@ -840,6 +949,237 @@ async def _generate_and_send_resume(message, tg_user, analysis_id: int):
         await message.reply_text(f"❌ Ошибка генерации резюме: {e}")
     finally:
         session.close()
+
+
+# =============================================================================
+# Balance & payments
+# =============================================================================
+
+async def _show_payment_options(message, resource: str):
+    prefix = (
+        "⚠️ Бесплатные аналитики закончились.\n\n"
+        if resource == "analyses"
+        else "⚠️ Бесплатные генерации резюме закончились.\n\n"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ 25 Stars — Старт (5+5)", callback_data="buy_stars_pack_5")],
+        [InlineKeyboardButton("⭐ 60 Stars — Стандарт (20+15)", callback_data="buy_stars_pack_20")],
+        [InlineKeyboardButton("⭐ 120 Stars — Про (50+30)", callback_data="buy_stars_pack_50")],
+        [InlineKeyboardButton("⭐ 200 Stars — Макс (100+100)", callback_data="buy_stars_pack_100")],
+        [InlineKeyboardButton("💳 Картой (Paymaster)", callback_data="buy_card_menu")],
+        [InlineKeyboardButton("💰 Перевод на Сбер", callback_data="buy_sber")],
+    ])
+    await message.reply_text(
+        prefix +
+        "📦 **Пакеты:**\n"
+        "• Старт: 5 аналитик + 5 резюме — 25 ⭐ / 199 ₽\n"
+        "• Стандарт: 20 аналитик + 15 резюме — 60 ⭐ / 499 ₽\n"
+        "• Про: 50 аналитик + 30 резюме — 120 ⭐ / 999 ₽\n"
+        "• Макс: 100 аналитик + 100 резюме — 200 ⭐ / 1 999 ₽",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Используй /start для начала.")
+        return
+
+    if is_unlimited(user.role):
+        await update.message.reply_text("♾ Безлимитный доступ")
+        return
+
+    text = (
+        f"📊 **Твой баланс:**\n\n"
+        f"🔍 Аналитик вакансий: {user.analyses_left}\n"
+        f"📄 Генераций резюме: {user.resumes_left}\n\n"
+    )
+    if user.analyses_left <= 0 or user.resumes_left <= 0:
+        text += "Пополнить 👇"
+    else:
+        text += "Для пополнения — /buy"
+
+    kb = None
+    if user.analyses_left <= 0 or user.resumes_left <= 0:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Купить пакет", callback_data="buy_menu")],
+        ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _show_payment_options(update.message, "buy")
+
+
+async def _send_stars_invoice(message, tg_user, pack_id: str):
+    """Send Telegram Stars invoice."""
+    pack = PACKAGES.get(pack_id)
+    if not pack:
+        return
+
+    await message.reply_invoice(
+        title=f"CareerBot — {pack['label']}",
+        description=_pack_description(pack),
+        payload=f"stars_{pack_id}_{tg_user.id}",
+        provider_token="",  # Empty for Stars
+        currency="XTR",
+        prices=[LabeledPrice(label=pack["label"], amount=pack["stars"])],
+    )
+
+
+async def _send_paymaster_invoice(message, tg_user, pack_id: str):
+    """Create Paymaster payment link via REST API and send as button."""
+    pack = PACKAGES.get(pack_id)
+    if not pack:
+        return
+
+    # Try native Telegram Payments first (if BotFather token exists)
+    if PAYMASTER_TOKEN:
+        await message.reply_invoice(
+            title=f"CareerBot — {pack['label']}",
+            description=_pack_description(pack),
+            payload=f"paymaster_{pack_id}_{tg_user.id}",
+            provider_token=PAYMASTER_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label=pack["label"], amount=pack["rub"])],
+        )
+        return
+
+    # Fallback: Paymaster REST API → payment link
+    if not PAYMASTER_API_TOKEN or not PAYMASTER_MERCHANT_ID:
+        await message.reply_text("💳 Оплата картой временно недоступна. Используй Stars.")
+        return
+
+    amount_rub = pack["rub"] / 100  # kopecks → rubles
+    payload = f"career_{pack_id}_{tg_user.id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://paymaster.ru/api/v2/invoices",
+                headers={
+                    "Authorization": f"Bearer {PAYMASTER_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "merchantId": PAYMASTER_MERCHANT_ID,
+                    "amount": {"value": amount_rub, "currency": "RUB"},
+                    "description": f"CareerBot — {pack['label']}",
+                    "paymentData": {"paymentId": payload},
+                },
+            )
+            data = resp.json()
+
+        pay_url = data.get("url")
+        if not pay_url:
+            logger.error("Paymaster no URL: %s", data)
+            await message.reply_text("❌ Ошибка создания платежа. Попробуй Stars.")
+            return
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💳 Оплатить {amount_rub:.0f} ₽", url=pay_url)],
+        ])
+        await message.reply_text(
+            f"📦 Пакет: **{pack['label']}**\n"
+            f"💰 Сумма: {amount_rub:.0f} ₽\n\n"
+            f"Нажми кнопку для оплаты картой.\n"
+            f"После оплаты напиши @Amoskv для активации.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    except Exception as e:
+        logger.error("Paymaster API error: %s", e)
+        await message.reply_text(f"❌ Ошибка платёжной системы: {e}\nПопробуй Stars.")
+
+
+def _pack_description(pack: dict) -> str:
+    return f"{pack['analyses']} аналитик вакансий + {pack['resumes']} генераций резюме"
+
+
+async def handle_precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Approve payment within 10 seconds."""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process successful payment — add balance."""
+    payment = update.message.successful_payment
+    tg_user = update.effective_user
+
+    # Parse payload: "stars_pack_10_123456" or "paymaster_pack_30_123456"
+    parts = payment.invoice_payload.split("_", 2)
+    provider = parts[0] if parts else "unknown"
+    pack_id = "_".join(parts[1:-1]) if len(parts) >= 3 else ""
+    # Reconstruct pack_id properly
+    payload = payment.invoice_payload
+    for pid in PACKAGES:
+        if pid in payload:
+            pack_id = pid
+            break
+
+    pack = PACKAGES.get(pack_id)
+    if not pack:
+        logger.error("Unknown package in payment: %s", payment.invoice_payload)
+        await update.message.reply_text("❌ Ошибка: неизвестный пакет. Обратись к @Amoskv")
+        return
+
+    # Save payment to DB
+    session = get_session()
+    user = session.query(User).filter_by(tg_id=tg_user.id).first()
+    if not user:
+        session.close()
+        return
+
+    pay_record = Payment(
+        user_id=user.id,
+        provider=provider,
+        currency=payment.currency,
+        amount=payment.total_amount,
+        package=pack_id,
+        telegram_charge_id=payment.telegram_payment_charge_id,
+        provider_charge_id=payment.provider_payment_charge_id or "",
+    )
+    session.add(pay_record)
+
+    # Apply package — add to balance
+    if user.analyses_left is None or user.analyses_left < 0:
+        user.analyses_left = pack["analyses"]
+    else:
+        user.analyses_left += pack["analyses"]
+    if user.resumes_left is None or user.resumes_left < 0:
+        user.resumes_left = pack["resumes"]
+    else:
+        user.resumes_left += pack["resumes"]
+
+    session.commit()
+    new_analyses = user.analyses_left
+    new_resumes = user.resumes_left
+    user_role = user.role
+    session.close()
+
+    # Confirm to user
+    balance_text = f"🔍 Аналитик: {new_analyses}\n📄 Резюме: {new_resumes}"
+
+    await update.message.reply_text(
+        f"✅ Оплата прошла!\n\n"
+        f"📦 Пакет: {pack['label']}\n"
+        f"📊 Баланс:\n{balance_text}\n\n"
+        f"Отправляй ссылку на вакансию — поехали! 🚀"
+    )
+
+    # Notify admin
+    await _notify_admin(
+        context.bot,
+        f"💰 Оплата CareerBot!\n"
+        f"👤 {tg_user.full_name} (@{tg_user.username or '—'})\n"
+        f"📦 {pack['label']} ({provider})\n"
+        f"💵 {payment.total_amount} {payment.currency}\n"
+        f"🆔 {payment.telegram_payment_charge_id}",
+    )
 
 
 # =============================================================================
@@ -876,6 +1216,51 @@ async def _send_long(message, text, reply_markup=None, parse_mode="Markdown"):
 
 
 # =============================================================================
+# Global error handler
+# =============================================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global error handler — logs errors and notifies user."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # Build short error description
+    err = context.error
+    if isinstance(err, httpx.TimeoutException):
+        err_text = "⏱ Таймаут запроса. Попробуй ещё раз через минуту."
+    elif isinstance(err, httpx.HTTPStatusError):
+        err_text = f"🌐 Ошибка HTTP {err.response.status_code}. Попробуй позже."
+    elif isinstance(err, (ConnectionError, httpx.ConnectError)):
+        err_text = "🔌 Ошибка соединения. Проверю и попробуй позже."
+    else:
+        err_text = "❌ Произошла ошибка. Попробуй ещё раз или напиши /start"
+
+    # Try to notify the user
+    if update and hasattr(update, "effective_message") and update.effective_message:
+        try:
+            await update.effective_message.reply_text(err_text)
+        except Exception:
+            pass
+    elif update and hasattr(update, "callback_query") and update.callback_query:
+        try:
+            await update.callback_query.message.reply_text(err_text)
+        except Exception:
+            pass
+
+    # Notify admin about non-trivial errors
+    if not isinstance(err, (httpx.TimeoutException,)):
+        try:
+            tb = traceback.format_exception(type(err), err, err.__traceback__)
+            short_tb = "".join(tb[-3:])[:1000]
+            await context.bot.send_message(
+                chat_id=ADMIN_TG_ID,
+                text=f"🚨 CareerBot error:\n<code>{short_tb}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -891,6 +1276,12 @@ def main():
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("buy", cmd_buy))
+
+    # Payments (must be before other message handlers)
+    app.add_handler(PreCheckoutQueryHandler(handle_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, handle_successful_payment))
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(handle_callback))
@@ -900,6 +1291,9 @@ def main():
 
     # Text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Global error handler
+    app.add_error_handler(error_handler)
 
     logger.info("CareerBot starting...")
     app.run_polling(drop_pending_updates=True)
