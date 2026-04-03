@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, LabeledPrice
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     PreCheckoutQueryHandler, filters, ContextTypes,
@@ -47,6 +48,7 @@ STATE_UPLOADING = "uploading"
 STATE_ANSWERING = "answering"
 STATE_READY = "ready"
 STATE_EDITING = "editing"
+STATE_RESUME_EDITING = "resume_editing"
 
 # Editable profile fields
 EDIT_FIELDS = {
@@ -415,7 +417,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Хорошо, начнём сначала. Загружай документы.", reply_markup=kb)
     elif data.startswith("gen_resume_"):
         analysis_id = int(data.split("_")[-1])
-        await _generate_and_send_resume(query.message, tg_user, analysis_id)
+        await _generate_and_send_resume(query.message, tg_user, analysis_id, context)
     elif data == "skip_resume":
         await query.message.reply_text("👌 Окей. Отправь ссылку на другую вакансию когда будет нужно.")
     elif data == "add_docs":
@@ -490,6 +492,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     value = data[len(f"setval_{fid}_"):]
                     break
         await _apply_edit(query.message, tg_user, field_id, value)
+    elif data == "edit_resume_text":
+        resume_data = context.user_data.get("last_resume_data")
+        if not resume_data:
+            await query.message.reply_text("❌ Нет данных резюме для редактирования. Сгенерируй резюме заново.")
+            return
+        # Build editable text representation
+        text = _resume_data_to_text(resume_data)
+        _update_state(tg_user.id, STATE_RESUME_EDITING)
+        await query.message.reply_text(
+            "✏️ **Редактирование резюме**\n\n"
+            "Ниже — текст резюме. Скопируй, отредактируй нужные блоки и отправь обратно.\n"
+            "Сохраняй структуру заголовков (`## СЕКЦИЯ`).\n\n"
+            "Для отмены нажми кнопку:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Отмена", callback_data="cancel_resume_edit")],
+            ]),
+        )
+        # Send resume text as code block (easy to copy)
+        # Split if too long for one message
+        chunks = _split_code_block(text, max_len=3900)
+        for chunk in chunks:
+            await query.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+    elif data == "cancel_resume_edit":
+        _update_state(tg_user.id, STATE_READY)
+        await query.message.reply_text(
+            "Отменено. Отправь ссылку на вакансию или используй меню.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Аналитика вакансии", callback_data="mode_vacancy")],
+                [InlineKeyboardButton("✏️ Редактировать профиль", callback_data="edit_menu")],
+            ]),
+        )
     elif data == "cancel_edit":
         _update_state(tg_user.id, STATE_READY)
         context.user_data.pop("editing_field", None)
@@ -623,6 +657,312 @@ async def _apply_edit(message, tg_user, field_id: str, value: str):
     session.close()
 
     await _show_edit_menu(message, f"✅ {field['label']} обновлено!\n\nЧто ещё изменить?")
+
+
+def _resume_data_to_text(rd: dict) -> str:
+    """Convert resume_data dict to editable plain text."""
+    lines = []
+    lines.append(f"## ИМЯ\n{rd.get('full_name', '')}")
+    lines.append(f"\n## ПОЗИЦИЯ\n{rd.get('target_position', '')}")
+
+    contacts = rd.get("contacts", {})
+    c_parts = []
+    for k in ("phone", "email", "telegram", "linkedin"):
+        if contacts.get(k):
+            c_parts.append(f"{k}: {contacts[k]}")
+    if c_parts:
+        lines.append(f"\n## КОНТАКТЫ\n" + "\n".join(c_parts))
+
+    lines.append(f"\n## О СЕБЕ\n{rd.get('summary', '')}")
+
+    exp = rd.get("experience", [])
+    if exp:
+        lines.append("\n## ОПЫТ РАБОТЫ")
+        for job in exp:
+            lines.append(f"\n### {job.get('company', '')} | {job.get('period', '')}")
+            lines.append(f"{job.get('position', '')}")
+            for ach in job.get("achievements", []):
+                lines.append(f"- {ach}")
+
+    edu = rd.get("education", [])
+    if edu:
+        lines.append("\n## ОБРАЗОВАНИЕ")
+        for e in edu:
+            lines.append(f"- {e.get('institution', '')} — {e.get('degree', '')} {e.get('field', '')}, {e.get('year', '')}")
+
+    skills = rd.get("skills", [])
+    if skills:
+        lines.append(f"\n## НАВЫКИ\n{', '.join(skills)}")
+
+    certs = rd.get("certifications", [])
+    if certs:
+        lines.append(f"\n## СЕРТИФИКАТЫ\n{', '.join(certs)}")
+
+    langs = rd.get("languages", [])
+    if langs:
+        lines.append(f"\n## ЯЗЫКИ\n{', '.join(langs)}")
+
+    return "\n".join(lines)
+
+
+def _text_to_resume_data(text: str) -> dict:
+    """Parse edited plain text back to resume_data dict."""
+    rd = {
+        "full_name": "", "target_position": "", "contacts": {},
+        "summary": "", "experience": [], "education": [],
+        "skills": [], "certifications": [], "languages": [],
+    }
+    current_section = None
+    current_job = None
+    buffer = []
+
+    def flush_buffer():
+        return "\n".join(buffer).strip()
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+
+        # Section headers
+        if line.startswith("## ИМЯ"):
+            current_section = "name"; buffer = []; continue
+        elif line.startswith("## ПОЗИЦИЯ"):
+            if current_section == "name": rd["full_name"] = flush_buffer()
+            current_section = "position"; buffer = []; continue
+        elif line.startswith("## КОНТАКТЫ"):
+            if current_section == "position": rd["target_position"] = flush_buffer()
+            current_section = "contacts"; buffer = []; continue
+        elif line.startswith("## О СЕБЕ"):
+            if current_section == "position": rd["target_position"] = flush_buffer()
+            if current_section == "contacts": _parse_contacts(rd, flush_buffer())
+            current_section = "summary"; buffer = []; continue
+        elif line.startswith("## ОПЫТ РАБОТЫ"):
+            if current_section == "summary": rd["summary"] = flush_buffer()
+            current_section = "experience"; buffer = []; current_job = None; continue
+        elif line.startswith("## ОБРАЗОВАНИЕ"):
+            if current_section == "experience" and current_job:
+                rd["experience"].append(current_job)
+            if current_section == "summary": rd["summary"] = flush_buffer()
+            current_section = "education"; buffer = []; current_job = None; continue
+        elif line.startswith("## НАВЫКИ"):
+            if current_section == "experience" and current_job:
+                rd["experience"].append(current_job)
+            if current_section == "education": _parse_education(rd, flush_buffer())
+            current_section = "skills"; buffer = []; continue
+        elif line.startswith("## СЕРТИФИКАТЫ"):
+            if current_section == "skills": rd["skills"] = [s.strip() for s in flush_buffer().split(",") if s.strip()]
+            current_section = "certs"; buffer = []; continue
+        elif line.startswith("## ЯЗЫКИ"):
+            if current_section == "certs": rd["certifications"] = [s.strip() for s in flush_buffer().split(",") if s.strip()]
+            if current_section == "skills": rd["skills"] = [s.strip() for s in flush_buffer().split(",") if s.strip()]
+            current_section = "langs"; buffer = []; continue
+
+        # Sub-section: experience job
+        if current_section == "experience" and line.startswith("### "):
+            if current_job:
+                rd["experience"].append(current_job)
+            # Parse "### Company | Period"
+            header = line[4:]
+            parts = header.split("|", 1)
+            current_job = {
+                "company": parts[0].strip(),
+                "period": parts[1].strip() if len(parts) > 1 else "",
+                "position": "",
+                "achievements": [],
+            }
+            continue
+
+        if current_section == "experience" and current_job:
+            if line.startswith("- "):
+                current_job["achievements"].append(line[2:])
+            elif line and not current_job["position"]:
+                current_job["position"] = line
+            elif line:
+                current_job["achievements"].append(line)
+            continue
+
+        buffer.append(raw_line)
+
+    # Flush last section
+    last = flush_buffer()
+    if current_section == "name": rd["full_name"] = last
+    elif current_section == "position": rd["target_position"] = last
+    elif current_section == "contacts": _parse_contacts(rd, last)
+    elif current_section == "summary": rd["summary"] = last
+    elif current_section == "experience" and current_job: rd["experience"].append(current_job)
+    elif current_section == "education": _parse_education(rd, last)
+    elif current_section == "skills": rd["skills"] = [s.strip() for s in last.split(",") if s.strip()]
+    elif current_section == "certs": rd["certifications"] = [s.strip() for s in last.split(",") if s.strip()]
+    elif current_section == "langs": rd["languages"] = [s.strip() for s in last.split(",") if s.strip()]
+
+    return rd
+
+
+def _parse_contacts(rd: dict, text: str):
+    contacts = {}
+    for line in text.split("\n"):
+        if ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().lower()
+            contacts[k] = v.strip()
+    rd["contacts"] = contacts
+
+
+def _parse_education(rd: dict, text: str):
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("- "):
+            line = line[2:]
+        if not line:
+            continue
+        # "Institution — Degree Field, Year"
+        parts = line.split("—", 1)
+        inst = parts[0].strip()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        year = ""
+        if "," in rest:
+            rest_parts = rest.rsplit(",", 1)
+            rest = rest_parts[0].strip()
+            year = rest_parts[1].strip()
+        degree = ""
+        field = rest
+        for d in ("Бакалавр", "Магистр", "Специалист", "Кандидат", "Доктор", "MBA", "PhD", "Bachelor", "Master"):
+            if d.lower() in rest.lower():
+                idx = rest.lower().index(d.lower())
+                degree = rest[idx:idx+len(d)]
+                field = (rest[:idx] + rest[idx+len(d):]).strip()
+                break
+        rd["education"].append({"institution": inst, "degree": degree, "field": field, "year": year})
+
+
+def _split_code_block(text: str, max_len: int = 3900) -> list[str]:
+    """Split text into chunks that fit in Telegram code blocks."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        cut = text[:max_len].rfind("\n")
+        if cut < max_len // 3:
+            cut = max_len
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
+async def _apply_resume_text_edit(message, tg_user, text: str, context):
+    """Parse user-edited resume text, regenerate files, update profile."""
+    from core.resume_generator import generate_pdf, generate_docx
+
+    # Parse the edited text back to resume_data
+    resume_data = _text_to_resume_data(text)
+
+    # Validate minimally
+    if not resume_data.get("full_name") and not resume_data.get("summary"):
+        await message.reply_text(
+            "❌ Не удалось распознать структуру. Сохраняй заголовки `## СЕКЦИЯ`.\n"
+            "Попробуй ещё раз или нажми «Отмена».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Отмена", callback_data="cancel_resume_edit")],
+            ]),
+        )
+        return
+
+    await message.reply_text("⏳ Пересобираю файлы с правками...")
+
+    try:
+        safe_name = context.user_data.get("last_resume_safe_name", "resume_edited")
+        analysis_id = context.user_data.get("last_resume_analysis_id")
+
+        # Regenerate PDF and DOCX
+        pdf_path = generate_pdf(resume_data, safe_name + "_v2")
+        docx_path = generate_docx(resume_data, safe_name + "_HH_v2")
+
+        # Save to DB
+        session = get_session()
+        user = session.query(User).filter_by(tg_id=tg_user.id).first()
+        if user and analysis_id:
+            pdf_record = GeneratedResume(
+                user_id=user.id,
+                vacancy_analysis_id=analysis_id,
+                format="pdf",
+                file_path=str(pdf_path),
+            )
+            docx_record = GeneratedResume(
+                user_id=user.id,
+                vacancy_analysis_id=analysis_id,
+                format="docx",
+                file_path=str(docx_path),
+            )
+            session.add(pdf_record)
+            session.add(docx_record)
+            session.commit()
+
+        # Update profile with user's edits (learn preferences)
+        if user:
+            profile = session.query(Profile).filter_by(user_id=user.id).first()
+            if profile and profile.profile_json:
+                pdata = json.loads(profile.profile_json)
+                # Merge user edits into profile preferences
+                if resume_data.get("summary"):
+                    pdata["preferred_summary"] = resume_data["summary"]
+                if resume_data.get("target_position"):
+                    # Add to preferred positions if not already there
+                    tp = pdata.get("target_positions", [])
+                    if isinstance(tp, list) and resume_data["target_position"] not in tp:
+                        tp.append(resume_data["target_position"])
+                        pdata["target_positions"] = tp
+                if resume_data.get("contacts"):
+                    existing = pdata.get("contacts", {})
+                    existing.update({k: v for k, v in resume_data["contacts"].items() if v})
+                    pdata["contacts"] = existing
+                # Save resume edit preferences
+                edits_log = pdata.get("resume_edit_preferences", [])
+                edits_log.append({
+                    "position": resume_data.get("target_position", ""),
+                    "summary_used": resume_data.get("summary", ""),
+                    "skills_used": resume_data.get("skills", []),
+                })
+                # Keep last 10 edits
+                pdata["resume_edit_preferences"] = edits_log[-10:]
+                pdata["profile_summary_for_user"] = _build_summary_text(pdata)
+                profile.profile_json = json.dumps(pdata, ensure_ascii=False)
+                session.commit()
+
+        session.close()
+
+        # Send files
+        await message.reply_document(
+            document=open(pdf_path, "rb"),
+            filename=f"{safe_name}_v2.pdf",
+            caption="📄 Обновлённое резюме (PDF)",
+        )
+        await message.reply_document(
+            document=open(docx_path, "rb"),
+            filename=f"{safe_name}_HH_v2.docx",
+            caption="📋 Обновлённое резюме (DOCX)",
+        )
+
+        # Update context with new resume data for further edits
+        context.user_data["last_resume_data"] = resume_data
+
+        _update_state(tg_user.id, STATE_READY)
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Ещё правки", callback_data="edit_resume_text")],
+            [InlineKeyboardButton("📄 Новая вакансия", callback_data="mode_vacancy")],
+        ])
+        await message.reply_text(
+            "✅ Резюме обновлено! Правки сохранены в профиль — "
+            "в следующий раз учту твои предпочтения.",
+            reply_markup=kb,
+        )
+
+    except Exception as e:
+        logger.error("Resume text edit failed: %s", e)
+        _update_state(tg_user.id, STATE_READY)
+        await message.reply_text(f"❌ Ошибка пересборки: {e}")
 
 
 def _build_summary_text(pdata: dict) -> str:
@@ -770,6 +1110,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не понял, что редактируем. Используй /update")
         return
 
+    # If editing resume text — parse and regenerate
+    if user.state == STATE_RESUME_EDITING:
+        await _apply_resume_text_edit(update.message, tg_user, text, context)
+        return
+
     # If answering questions — save answers
     if user.state == STATE_ANSWERING:
         answers = context.user_data.get("answers", [])
@@ -865,7 +1210,7 @@ async def _handle_vacancy_input(update, context, user, text):
 # Resume generation
 # =============================================================================
 
-async def _generate_and_send_resume(message, tg_user, analysis_id: int):
+async def _generate_and_send_resume(message, tg_user, analysis_id: int, context=None):
     # Check resume limit for trial users
     session = get_session()
     user = session.query(User).filter_by(tg_id=tg_user.id).first()
@@ -936,12 +1281,23 @@ async def _generate_and_send_resume(message, tg_user, analysis_id: int):
                 f"резюме — {user.resumes_left}"
             )
 
+        # Store resume data for potential editing
+        if context:
+            context.user_data["last_resume_data"] = resume_data
+            context.user_data["last_resume_analysis_id"] = analysis_id
+            context.user_data["last_resume_safe_name"] = safe_name
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Редактировать текст резюме", callback_data="edit_resume_text")],
+        ])
         await message.reply_text(
             "✅ Готово! Два файла:\n"
             "• PDF — красивый, для email/ЛС\n"
             "• DOCX — для загрузки на hh.ru\n\n"
-            "Отправь ссылку на другую вакансию для новой аналитики."
-            + balance_text
+            "Нажми «Редактировать» чтобы поправить текст, "
+            "или отправь ссылку на другую вакансию."
+            + balance_text,
+            reply_markup=kb,
         )
 
     except Exception as e:
@@ -1221,13 +1577,22 @@ async def _send_long(message, text, reply_markup=None, parse_mode="Markdown"):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Global error handler — logs errors and notifies user."""
+    err = context.error
+
+    # Silently ignore polling network errors (TimedOut, Bad Gateway)
+    # These are transient Telegram API hiccups, not bugs
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning("Transient Telegram error (ignored): %s", err)
+        return
+
+    if isinstance(err, httpx.TimeoutException):
+        logger.warning("httpx timeout (ignored): %s", err)
+        return
+
     logger.error("Exception while handling an update:", exc_info=context.error)
 
     # Build short error description
-    err = context.error
-    if isinstance(err, httpx.TimeoutException):
-        err_text = "⏱ Таймаут запроса. Попробуй ещё раз через минуту."
-    elif isinstance(err, httpx.HTTPStatusError):
+    if isinstance(err, httpx.HTTPStatusError):
         err_text = f"🌐 Ошибка HTTP {err.response.status_code}. Попробуй позже."
     elif isinstance(err, (ConnectionError, httpx.ConnectError)):
         err_text = "🔌 Ошибка соединения. Проверю и попробуй позже."
@@ -1246,18 +1611,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-    # Notify admin about non-trivial errors
-    if not isinstance(err, (httpx.TimeoutException,)):
-        try:
-            tb = traceback.format_exception(type(err), err, err.__traceback__)
-            short_tb = "".join(tb[-3:])[:1000]
-            await context.bot.send_message(
-                chat_id=ADMIN_TG_ID,
-                text=f"🚨 CareerBot error:\n<code>{short_tb}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+    # Notify admin about non-trivial errors only
+    try:
+        tb = traceback.format_exception(type(err), err, err.__traceback__)
+        short_tb = "".join(tb[-3:])[:1000]
+        await context.bot.send_message(
+            chat_id=ADMIN_TG_ID,
+            text=f"🚨 CareerBot error:\n<code>{short_tb}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1268,7 +1632,25 @@ def main():
     init_db()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connect_timeout=10.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .get_updates_request(HTTPXRequest(
+            connect_timeout=10.0,
+            read_timeout=45.0,  # long-polling needs longer read timeout
+            write_timeout=10.0,
+            pool_timeout=10.0,
+        ))
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1296,7 +1678,11 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("CareerBot starting...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        poll_interval=1.0,
+        timeout=30,  # long-polling timeout for getUpdates
+    )
 
 
 if __name__ == "__main__":
