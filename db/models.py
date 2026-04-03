@@ -18,6 +18,10 @@ class User(Base):
     # new | uploading | answering | ready | confirming_resume
     state = Column(String(50), default="new")
     pending_analysis_id = Column(Integer, nullable=True)
+    # Access control: trial (default) / paid / admin
+    role = Column(String(20), default="trial")
+    analyses_left = Column(Integer, default=3)
+    resumes_left = Column(Integer, default=2)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     profile = relationship("Profile", back_populates="user", uselist=False)
@@ -89,3 +93,19 @@ class GeneratedResume(Base):
 
     user = relationship("User", back_populates="generated_resumes")
     vacancy_analysis = relationship("VacancyAnalysis", back_populates="generated_resumes")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    provider = Column(String(20))  # stars, paymaster, manual
+    currency = Column(String(10))  # XTR, RUB
+    amount = Column(Integer)  # Stars or kopecks
+    package = Column(String(50))  # pack_10, pack_30, unlimited
+    telegram_charge_id = Column(String(200))
+    provider_charge_id = Column(String(200))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User")
