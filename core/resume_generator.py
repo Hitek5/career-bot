@@ -56,11 +56,31 @@ def _clean_json(text: str) -> str:
 
 async def generate_resume_data(profile_json: str, analysis_json: str) -> dict:
     """Generate adapted resume content via AI."""
+    # Extract enrichment data if available
+    extra_context = ""
+    try:
+        profile_data = json.loads(profile_json)
+        if profile_data.get("enriched_description"):
+            extra_context += (
+                f"\nОПИСАНИЕ КАНДИДАТА (из анализа предыдущих правок):\n"
+                f"{profile_data['enriched_description']}\n"
+            )
+        if profile_data.get("preferred_style"):
+            extra_context += (
+                f"\nПРЕДПОЧТИТЕЛЬНЫЙ СТИЛЬ РЕЗЮМЕ:\n"
+                f"{profile_data['preferred_style']}\n"
+            )
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     user_msg = (
         f"ПРОФИЛЬ КАНДИДАТА:\n{profile_json}\n\n"
-        f"АНАЛИЗ ВАКАНСИИ:\n{analysis_json}\n\n"
-        "Создай адаптированное резюме под эту вакансию."
+        f"АНАЛИЗ ВАКАНСИИ:\n{analysis_json}\n"
     )
+    if extra_context:
+        user_msg += f"\nДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:{extra_context}\n"
+    user_msg += "\nСоздай адаптированное резюме под эту вакансию."
+
     response = await call_claude(SYSTEM_PROMPT, user_msg, max_tokens=4096)
     return json.loads(_clean_json(response))
 

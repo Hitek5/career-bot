@@ -654,6 +654,12 @@ async def _apply_edit(message, tg_user, field_id: str, value: str):
 
     user.state = STATE_READY
     session.commit()
+
+    # Enrich profile if there are edit preferences to learn from
+    if pdata.get("resume_edit_preferences"):
+        import asyncio
+        asyncio.create_task(_enrich_profile_safe(user.id))
+
     session.close()
 
     await _show_edit_menu(message, f"✅ {field['label']} обновлено!\n\nЧто ещё изменить?")
@@ -924,11 +930,14 @@ async def _apply_resume_text_edit(message, tg_user, text: str, context):
                     "summary_used": resume_data.get("summary", ""),
                     "skills_used": resume_data.get("skills", []),
                 })
-                # Keep last 10 edits
-                pdata["resume_edit_preferences"] = edits_log[-10:]
+                pdata["resume_edit_preferences"] = edits_log
                 pdata["profile_summary_for_user"] = _build_summary_text(pdata)
                 profile.profile_json = json.dumps(pdata, ensure_ascii=False)
                 session.commit()
+
+                # Enrich profile in background — don't block user
+                import asyncio
+                asyncio.create_task(_enrich_profile_safe(user.id))
 
         session.close()
 
@@ -963,6 +972,69 @@ async def _apply_resume_text_edit(message, tg_user, text: str, context):
         logger.error("Resume text edit failed: %s", e)
         _update_state(tg_user.id, STATE_READY)
         await message.reply_text(f"❌ Ошибка пересборки: {e}")
+
+
+async def _enrich_profile_safe(user_id: int):
+    """Run profile enrichment in background, swallow errors."""
+    try:
+        await enrich_profile_from_edits(user_id)
+    except Exception as e:
+        logger.error("Profile enrichment failed for user %s: %s", user_id, e)
+
+
+async def enrich_profile_from_edits(user_id: int):
+    """Analyze resume edit history and enrich profile with AI-derived patterns."""
+    from core.ai_engine import call_claude
+
+    session = get_session()
+    try:
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            return
+        profile = session.query(Profile).filter_by(user_id=user.id).first()
+        if not profile or not profile.profile_json:
+            return
+
+        pdata = json.loads(profile.profile_json)
+        edits = pdata.get("resume_edit_preferences", [])
+        if len(edits) < 2:
+            return  # need at least 2 edits to find patterns
+
+        edits_text = json.dumps(edits, ensure_ascii=False)
+        current_profile = json.dumps({
+            k: pdata.get(k) for k in (
+                "full_name", "summary", "target_positions", "skills",
+                "experience", "preferred_summary", "values", "strengths",
+            ) if pdata.get(k)
+        }, ensure_ascii=False)
+
+        resp = await call_claude(
+            "Ты — карьерный аналитик. Проанализируй историю правок резюме пользователя "
+            "и его текущий профиль. Выяви паттерны и предпочтения.\n\n"
+            "Верни JSON:\n"
+            '{\n'
+            '  "enriched_description": "Развёрнутое описание кандидата (3-5 предложений): '
+            'сильные стороны, ключевые навыки, стиль подачи, что считает важным",\n'
+            '  "preferred_style": "Краткое описание стиля резюме: '
+            'формальный/неформальный, с цифрами/без, лаконичный/подробный, акценты"\n'
+            '}\n\nТолько JSON.',
+            f"ТЕКУЩИЙ ПРОФИЛЬ:\n{current_profile}\n\n"
+            f"ИСТОРИЯ ПРАВОК ({len(edits)} шт.):\n{edits_text}",
+            max_tokens=2000,
+        )
+
+        m = re.search(r'(\{[\s\S]*\})', resp)
+        if m:
+            result = json.loads(m.group(1))
+            if result.get("enriched_description"):
+                pdata["enriched_description"] = result["enriched_description"]
+            if result.get("preferred_style"):
+                pdata["preferred_style"] = result["preferred_style"]
+            profile.profile_json = json.dumps(pdata, ensure_ascii=False)
+            session.commit()
+            logger.info("Profile enriched for user %s", user_id)
+    finally:
+        session.close()
 
 
 def _build_summary_text(pdata: dict) -> str:
