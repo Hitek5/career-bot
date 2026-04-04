@@ -35,8 +35,8 @@ def _convert_to_docx(file_path: Path) -> Path:
             capture_output=True,
             timeout=120,
         )
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace")
+        stderr = result.stderr.decode(errors="replace")
+        if result.returncode != 0 or "Error:" in stderr:
             raise RuntimeError(f"LibreOffice conversion failed: {stderr}")
 
         converted = Path(tmp_dir) / (file_path.stem + ".docx")
@@ -106,6 +106,21 @@ def parse_document(file_path: str | Path) -> str:
             return parse_docx(str(file_path))
 
         if ext in LIBREOFFICE_FORMATS:
+            # For .doc files, try antiword/catdoc first (faster, no LO lock issues)
+            if ext == ".doc":
+                for tool in ("antiword", "catdoc"):
+                    try:
+                        r = subprocess.run(
+                            [tool, str(file_path)],
+                            capture_output=True, timeout=30,
+                        )
+                        if r.returncode == 0:
+                            text = r.stdout.decode("utf-8", errors="replace").strip()
+                            if text:
+                                return text
+                    except (FileNotFoundError, subprocess.TimeoutExpired):
+                        continue
+
             # Convert to docx first, then parse with python-docx
             try:
                 docx_path = _convert_to_docx(file_path)
@@ -138,7 +153,8 @@ def parse_document(file_path: str | Path) -> str:
                     return f.read()
             except Exception as e:
                 raise RuntimeError(
-                    f"Не удалось обработать {file_path.name} ({ext}): {e}"
+                    f"Не удалось обработать {file_path.name} ({ext}). "
+                    f"Попробуйте сохранить как .docx или .pdf и загрузить снова."
                 )
 
         raise ValueError(f"Неподдерживаемый формат: {ext}")
